@@ -5,49 +5,6 @@
 #include <QStyleOption>
 #include <QPainter>
 
-// -------------------------- 接收线程（RecvThread）实现 --------------------------
-RecvThread::RecvThread(QTcpSocket* socket, QObject* parent)
-    : QThread(parent), m_socket(socket), m_running(true) {}
-
-RecvThread::~RecvThread() {
-    stop();
-    wait();  // 等待线程完全退出，避免内存泄漏
-}
-
-void RecvThread::stop() {
-    m_mutex.lock();
-    m_running = false;  // 设置退出标记
-    m_mutex.unlock();
-}
-
-void RecvThread::run() {
-    while (true) {
-        // 检查线程是否需要退出
-        m_mutex.lock();
-        bool running = m_running;
-        m_mutex.unlock();
-        if (!running) break;
-
-        // 检查socket是否有效
-        if (!m_socket || !m_socket->isValid()) break;
-
-        // 接收服务器发送的「时间」（固定40字节，与服务器协议一致）
-        if(!m_socket->waitForReadyRead(-1));        //阻塞接收
-        QByteArray Data = m_socket->readAll();
-        if (Data.isEmpty()) {
-            qDebug("shit");
-            // 数据为空 → 连接断开
-            emit sigDisconnected();
-            break;
-        }
-        QString timeStr = QString::fromUtf8(Data).trimmed();  // 去除补全的空格
-
-        // 接收服务器发送的「消息内容」（固定1024字节）
-        qDebug("noway");
-        // 发送信号给主线程，更新界面（线程不能直接操作UI）
-        emit sigRecvMsg(timeStr);
-    }
-}
 
 // -------------------------- 主窗口（MainWindow）实现 --------------------------
 MainWindow::MainWindow(QWidget* parent)
@@ -66,17 +23,20 @@ MainWindow::MainWindow(QWidget* parent)
         m_isConnected = true;
         slotConnectStatusChanged(true);
         ui->txtMsgDisplay->append("【系统提示】连接服务器成功！");
-
-        // 创建并启动接收线程
-        m_recvThread = new RecvThread(m_tcpSocket, this);
-        connect(m_recvThread, &RecvThread::sigRecvMsg, this, &MainWindow::slotRecvMsg);
-        //这里是检测服务器那边导致的断开连接
-        connect(m_recvThread, &RecvThread::sigDisconnected, this, &MainWindow::slotDisconnected);
-        m_recvThread->start();
+        connect(m_tcpSocket,&QTcpSocket::readyRead,this,[this]()
+        {
+            if(m_tcpSocket->bytesAvailable()<=0)
+                return;
+            //注意收发两端文本要使用对应的编解码
+            const QByteArray recv_byteArr=m_tcpSocket->readAll();
+            const QString recv_text=QString::fromUtf8(recv_byteArr);
+            RecvMsg(recv_text);
+            qDebug()<<recv_text;
+        });
     });
 
     // 连接断开信号
-    //这里检测的是客户端试图主动关闭窗口导致的断开连接。
+    //这里检测的是tcp连接是否中断，并终止客户端程序
     connect(m_tcpSocket, &QTcpSocket::disconnected, this, &MainWindow::slotDisconnected);
 
     // 连接失败信号
@@ -88,11 +48,6 @@ MainWindow::MainWindow(QWidget* parent)
 }
 
 MainWindow::~MainWindow() {
-    // 资源释放：先停止线程，再断开连接
-    if (m_recvThread) {
-        m_recvThread->stop();
-        delete m_recvThread;
-    }
     m_tcpSocket->disconnectFromHost();
     delete ui;
 }
@@ -155,11 +110,9 @@ void MainWindow::sendMsg() {
 }
 
 // 接收消息更新界面（主线程执行，安全操作UI）
-void MainWindow::slotRecvMsg(const QString& time) {
+void MainWindow::RecvMsg(const QString& msg) {
     // 显示他人消息（蓝色时间+黑色内容）
-    ui->txtMsgDisplay->append(QString("<span style='color: #4A90E2;'>%1</span> ")
-                              .arg(time));
-
+    ui->txtMsgDisplay->append(msg);
     // 自动滚动到最新消息
     QTextCursor cursor = ui->txtMsgDisplay->textCursor();
     cursor.movePosition(QTextCursor::End);
@@ -172,13 +125,10 @@ void MainWindow::slotDisconnected() {
     slotConnectStatusChanged(false);
     ui->txtMsgDisplay->append("【系统提示】与服务器断开连接！");
 
-    // 停止接收线程
-    if (m_recvThread) {
-        m_recvThread->stop();
-    }
 }
 
 // 连接状态变化：更新状态标签
+//刚开始，socket检查到连接上服务器后执行一次，socket连接断开时通过断开处理槽函数再执行一次。
 void MainWindow::slotConnectStatusChanged(bool isConnected) {
     if (isConnected) {
         ui->lblStatus->setText("状态：已连接");
